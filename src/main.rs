@@ -8,9 +8,22 @@ fn main() -> io::Result<()> {
     let mut buf = [0u8; 1504];
     loop {
         let nbytes = nic.recv(&mut buf[..])?;
-        let flags = u16::from_be_bytes([buf[0], buf[1]]);
-        let proto = u16::from_be_bytes([buf[2], buf[3]]);
-        eprintln!("flags {} proto {} {:?}", flags, proto, &buf[4..nbytes]);
+        let _flags = u16::from_be_bytes([buf[0], buf[1]]);
+        let eth_proto = u16::from_be_bytes([buf[2], buf[3]]);
+        if eth_proto != 0x0800 {
+            continue;
+        }
+        match etherparse::Ipv4HeaderSlice::from_slice(&buf[4..nbytes]) {
+            Ok(p) => {
+                let src = p.source_addr();
+                let dst = p.destination_addr();
+                let proto = p.protocol();
+                eprintln!("{} -> {} {}b of protocol {:x}", src, dst, p.payload_len(),proto);
+            },
+            Err(_e) => {
+                println!("ignoring packet")
+            },
+        }
     }
     Ok(())
 }
