@@ -13,6 +13,7 @@ impl Default for State {
     }
 }
 
+
 #[derive(Clone, Copy, Hash, Eq, Debug, PartialEq)]
 pub struct Quad {
     pub src: (Ipv4Addr, u16),
