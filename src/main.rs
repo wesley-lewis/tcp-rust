@@ -5,12 +5,13 @@ use std::collections::HashMap;
 
 mod tcp;
 
-fn main() -> io::Result<()>{
+fn main() -> io::Result<()> {
     let mut connections: HashMap<tcp::Quad, tcp::Connection> = Default::default();
     let mut nic = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun).expect("failed to cr");
     let mut buf = [0u8; 1504];
     loop {
         let nbytes = nic.recv(&mut buf[..])?;
+        // if s/without_packet_info/new/:
         // let flags = u16::from_be_bytes([buf[0], buf[1]]);
         // let proto = u16::from_be_bytes([buf[2], buf[3]]);
         //
@@ -18,6 +19,8 @@ fn main() -> io::Result<()>{
         //     // not a ipv4 packet
         //     continue;
         // }
+        //
+        // also include on send
 
         match etherparse::Ipv4HeaderSlice::from_slice(&buf[..nbytes]) {
             Ok(iph) => { 
@@ -64,4 +67,4 @@ fn main() -> io::Result<()>{
     Ok(())
 }
 
-// 1:08:18
+// 4:05:57
