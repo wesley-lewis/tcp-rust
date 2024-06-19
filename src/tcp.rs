@@ -10,6 +10,8 @@ pub enum State {
     SynRcvd,
     Estab,
     FinWait1,
+    FinWait2,
+    TimeWait,
     Closing,
 }
 
@@ -17,7 +19,11 @@ impl State {
     fn is_synchronized(&self) -> bool {
         match *self {
             Self::SynRcvd => false,
-            Self::Estab | Self::FinWait1 | Self::Closing => true,
+            Self::Estab | 
+                Self::FinWait1 | 
+                Self::FinWait2 | 
+                Self::Closing  | 
+                Self::TimeWait => true,
         }
     }
 }
@@ -29,6 +35,7 @@ pub struct Connection {
     ip: etherparse::Ipv4Header,
     tcp: etherparse::TcpHeader,
 }
+
 struct SendSequenceSpace {
     /// send unacknowledged 
     una: u32, 
@@ -40,6 +47,7 @@ struct SendSequenceSpace {
     up: bool, 
     /// segment acknowledgement number used for last window
     wl1: usize, 
+    wl2: usize,
     /// initial send sequence number
     iss: u32,
 }
@@ -67,7 +75,7 @@ impl Connection {
         iph: etherparse::Ipv4HeaderSlice<'a>, 
         tcph: etherparse::TcpHeaderSlice<'a>, 
         data: &'a [u8]
-    ) -> io::Result<Option<Self>>{
+    ) -> io::Result<Option<Self>> {
         let mut buf = [0u8; 1500];
         if !tcph.syn() {
             // only expected SYN packet
@@ -85,6 +93,7 @@ impl Connection {
                 wnd,
                 up: false,
                 wl1: 0,
+                wl2: 0,
             },
             recv: RecvSequenceSpace {
                 irs: tcph.sequence_number(),
@@ -134,8 +143,9 @@ impl Connection {
             buf.len(), 
             self.tcp.header_len() as usize + self.ip.header_len() + payload.len()
         );
-        self.ip.set_payload_len(size);
+        self.ip.set_payload_len(size - self.ip.header_len() as usize);
 
+        // Calculating the checksum
         self.tcp.checksum = self.tcp.calc_checksum_ipv4(&self.ip, &[]).expect("failed to compute checksum");
 
         let mut unwritten = &mut buf[..];
@@ -152,7 +162,9 @@ impl Connection {
             self.send.nxt = self.send.nxt.wrapping_add(1);
             self.tcp.fin = false;
         }
-        nic.send(&buf[..buf.len() - unwritten])
+
+        nic.send(&buf[..buf.len() - unwritten])?;
+        Ok(payload_bytes)
     }
 
     fn send_rst(
@@ -181,15 +193,8 @@ impl Connection {
         // acceptable ACK check
         // SND.UNA < SEG.ACK =< SND.NXT
         // but remember wrapping!
-        //
-        let ackn = tcph.acknowledgment_number();
-        if !is_between_wrapped(self.send.una, ackn, self.send.nxt) {
-            if !self.state.is_synchronized() {
-                // according to RESET generation send a RST
-                self.send_rst(nic);
-            }
-            return Ok(());
-        }
+        
+        
 
         // valid segment check. okay if it acks at least one byte, which means that at least one of
         // the following is true
@@ -213,6 +218,7 @@ impl Connection {
             // zero-length segment has separate rules for acceptance
             if self.recv.wnd == 0 {
                 if seqn != self.recv.nxt {
+                    self.write(nic, &[])?;
                     return Ok(());
                 }
             }else {
@@ -221,11 +227,13 @@ impl Connection {
                     seqn, 
                     wend
                 ) {
+                    self.write(nic, &[])?;
                     return Ok(());
                 }
             }
         } else {
             if self.recv.wnd == 0 {
+                self.write(nic, &[])?;
                 return Ok(());
             } else if !is_between_wrapped(
                     self.recv.nxt.wrapping_sub(1), 
@@ -234,42 +242,100 @@ impl Connection {
                 ) && 
                     !is_between_wrapped(
                         self.recv.nxt.wrapping_sub(1), 
-                        seqn + data.len() as u32 - 1, 
+                        seqn.wrapping_add(slen - 1),
                         wend
                 ) {
+                    self.write(nic, &[])?;
                     return Ok(());
             }
         }
+        self.recv.nxt = seqn.wrapping_add(slen);
+        // TODO: if not acceptable, send ACK
+        
+        if !tcph.ack() {
+            return Ok(());
+        }
 
-        match self.state {
-            State::SynRcvd => {
-                // expect to get an ACK for our syn
-                if !tcph.ack() {
-                    return Ok(());
-                }
+        let ackn = tcph.acknowledgment_number();
+        // if !is_between_wrapped(self.send.una, ackn, self.send.nxt) {
+        //     if !self.state.is_synchronized() {
+        //         // according to RESET generation send a RST
+        //         self.send_rst(nic);
+        //     }else {
+        //         return Ok(());
+        //     }
+        // }
+        // self.send.una = ackn; 
+        //
+        if let State::SynRcvd = self.state {
+            if is_between_wrapped(self.send.una.wrapping_sub(1), ackn, self.send.nxt.wrapping_add(1)) {
+                self.state = State::Estab;
+            }else {
+                // TODO: RST
+            }
+        }
+            // State::SynRcvd => {
+            //
+                // // expect to get an ACK for our syn
+                // if !tcph.ack() {
+                //     return Ok(());
+                // }
+                //
                 // must have ACKed our SYN, since we detected at least one acked byte, and we have
                 // only sent one byte (the SYN).
-                self.state = State::Estab;
+                // self.state = State::Estab;
+            // },
 
-                // now let's terminate the connection
-                // TODO: needs to be stored in the retransmission queue
+        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+            if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+                return Ok(());
+            }
+            self.send.una = ackn;
+            // TODO:
+            assert!(data.is_empty());
+
+            // now let's terminate the connection
+            // TODO: needs to be stored in the retransmission queue
+            if let State::Estab = self.state {
                 self.tcp.fin = true;
                 self.write(nic, &[])?;
                 self.state = State::FinWait1;
-            },
-            State::Estab => unimplemented!(),
-            State::FinWait1 => {
-                if !tcph.fin()  || !data.is_empty() {
-                    unimplemented!();
-                }
+            }
+        }
 
-                // they must have ACKed our FIN, since we detected at least one acked
-                // byte, and we must have only sent one byte ( the FIN )
-                self.tcp.fin = false;
-                self.write(nic, &[])?;
-                self.state = State::Closing;
-            },
-            _ => {}
+        if let State::FinWait1 = self.state {
+            if self.send.una == self.send.iss + 2 {
+                // our FIN has been ACKed
+                self.state = State::FinWait2;
+            }
+        }
+
+        if tcph.fin() {
+            match self.state {
+                State::FinWait2 => {
+                    // we're done with the connection
+
+                    self.write(nic, &[])?;
+                    self.state = State::TimeWait;
+                }
+                _ => unimplemented!(),
+            }
+        }
+
+        if let State::FinWait2 = self.state {
+            if !tcph.fin()  || !data.is_empty() {
+                unimplemented!();
+            }
+
+            // they must have ACKed our FIN, since we detected at least one acked
+            // byte, and we must have only sent one byte ( the FIN )
+            self.tcp.fin = false;
+            self.write(nic, &[])?;
+            self.state = State::Closing;
+
+            self.tcp.fin = false;
+            self.write(nic, &[])?;
+            self.state = State::Closing;
         }
 
         Ok(())
